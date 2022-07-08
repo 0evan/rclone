@@ -323,6 +323,11 @@ and pass variables with spaces in in quotes, eg
 
 `,
 			Advanced: true,
+		}, {
+			Name:    "server_alive_interval",
+			Default: fs.Duration(60 * time.Second),
+			Help: ``,
+			Advanced: true,
 		}},
 	}
 	fs.Register(fsi)
@@ -355,6 +360,7 @@ type Options struct {
 	DisableConcurrentReads  bool            `config:"disable_concurrent_reads"`
 	DisableConcurrentWrites bool            `config:"disable_concurrent_writes"`
 	IdleTimeout             fs.Duration     `config:"idle_timeout"`
+	ServerAliveInterval     fs.Duration     `config:"server_alive_interval"`
 	ChunkSize               fs.SizeSuffix   `config:"chunk_size"`
 	Concurrency             int             `config:"concurrency"`
 	SetEnv                  fs.SpaceSepList `config:"set_env"`
@@ -378,6 +384,7 @@ type Fs struct {
 	poolMu       sync.Mutex
 	pool         []*conn
 	drain        *time.Timer // used to drain the pool when we stop using the connections
+	keepAlive    *time.Timer // used to send keep alives durring connection 
 	pacer        *fs.Pacer   // pacer for operations
 	savedpswd    string
 	sessions     int32 // count in use sessions
@@ -660,6 +667,21 @@ func (f *Fs) drainPool(ctx context.Context) (err error) {
 	return err
 }
 
+func (f *Fs) serverKeepAlive(ctx context.Context) (err error) {
+    f.poolMu.Lock()
+    defer f.poolMu.Unlock()
+    if len(f.pool) != 0 {
+        fs.Debugf(f, "Sending %d connection keepalives", len(f.pool))
+    }
+    for range f.pool {
+	c, err := f.getSftpConnection(ctx)
+	if err != nil {
+		return fmt.Errorf("serverKeepAlive: %w", err)
+	}
+	f.putSftpConnection(&c, errors.New("connection keepalive failed"))
+    }
+}
+
 // NewFs creates a new Fs object from the name and root. It connects to
 // the host specified in the config file.
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
@@ -883,6 +905,10 @@ func NewFsWithConnection(ctx context.Context, f *Fs, name string, root string, m
 	// set the pool drainer timer going
 	if f.opt.IdleTimeout > 0 {
 		f.drain = time.AfterFunc(time.Duration(f.opt.IdleTimeout), func() { _ = f.drainPool(ctx) })
+	}
+        // need comment
+	if f.opt.ServerAliveInterval > 0 {
+		f.keepAlive = time.AfterFunc(time.Duration(f.opt.ServerAliveInterval), func() { _ = f.serverKeepAlive(ctx) })
 	}
 
 	f.features = (&fs.Features{
